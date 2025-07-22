@@ -1,0 +1,8 @@
+src/
+test.js
+rollup.config.js
+node_modules/
+.git/
+.gitignore
+*.log
+*.md 

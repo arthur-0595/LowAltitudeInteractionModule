@@ -1,0 +1,31 @@
+{
+  "name": "@hlid/cesium-engine",
+  "version": "1.0.3",
+  "description": "封装好的 Cesium 场景 SDK",
+  "main": "dist/index.min.js",
+  "scripts": {
+    "build": "rollup -c",
+    "test": "echo \"No test specified\" && exit 0"
+  },
+  "dependencies": {
+    "cesium": "1.120.0",
+    "mitt": "^3.0.1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/arthur-0595/cesium-engine.git"
+  },
+  "keywords": ["cesium", "3d", "engine", "低空交互", "可视化"],
+  "author": "black",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/arthur-0595/cesium-engine/issues"
+  },
+  "homepage": "https://github.com/arthur-0595/cesium-engine#readme",
+  "devDependencies": {
+    "@rollup/plugin-terser": "^0.4.4",
+    "rollup": "^4.45.1",
+    "rollup-plugin-commonjs": "^10.1.0",
+    "rollup-plugin-node-resolve": "^5.2.0"
+  }
+}
