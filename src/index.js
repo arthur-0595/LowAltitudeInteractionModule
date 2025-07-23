@@ -12,6 +12,7 @@ class LowAltitudeInteraction {
     this.options = options; // 用户传入配置
     this.viewer = null; // Cesium.Viewer 实例
     this.entities = new Map(); // id -> Cesium.Entity
+    this.primitiveMap = new Map(); // id -> Cesium.Primitive
     this.modelPositions = []; // 点位合集（不一定有用，先存着）
     this.emitter = mitt(); // 事件总线
     this._airspaceClick = null;
@@ -432,9 +433,9 @@ class LowAltitudeInteraction {
   }
 
   /* =========== 绘制执飞空域 =========== */
-  // Cesium.Color 下常用的颜色有：WHITE、BLACK、RED、GREEN、BLUE、YELLOW、CYAN、MAGENTA、GRAY、BROWN、ORANGE、PINK、PURPLE、LIME、OLIVE、NAVY、TEAL、MAROON、SILVER
   drawAirspaces(areas, options = {}) {
-    const defaultColor = Cesium.Color[options.defaultColor]?.withAlpha(0.35) || Cesium.Color.CYAN.withAlpha(0.35);
+    if (!this.viewer) throw new Error('请先调用 init()!');
+
     this._airspaceClick = options.onClick || function () {};
     this._initHandler();
 
@@ -446,7 +447,7 @@ class LowAltitudeInteraction {
       if (!area.points || area.points.length < 3) return;
       // 扁平化 [lon, lat, height, ...]
       const positions = area.points.flat();
-
+      const color = this._parseColor(area.color, area.alpha || 0.4);
       // 在添加时判断id是否存在，如果存在，则删除，再添加新的
       // 此处因为空域数量不会太多所以这样处理，数量超过以前则需要别的解决方案
       const exists = this.viewer.entities.getById(area.id);
@@ -459,9 +460,9 @@ class LowAltitudeInteraction {
         polygon: {
           hierarchy: Cesium.Cartesian3.fromDegreesArrayHeights(positions),
           perPositionHeight: true,
-          material: Cesium.Color[area.color]?.withAlpha(0.35) || defaultColor,
-          outline: true,
-          outlineColor: Cesium.Color.WHITE.withAlpha(0.7),
+          material: color,
+          outline: area.outline || false,
+          outlineColor: Cesium.Color.WHITE.withAlpha(0.6),
           extrudedHeight: area.height,
 
           closeTop: area.hasTop || false,
@@ -489,7 +490,7 @@ class LowAltitudeInteraction {
 
   /* =========== 绘制电子围栏 =========== */
   drawFence(areas, options = {}) {
-    const defaultColor = Cesium.Color[options.defaultColor]?.withAlpha(0.35) || Cesium.Color.CYAN.withAlpha(0.35);
+    if (!this.viewer) throw new Error('请先调用 init()!');
     this._fenceClick = options.onClick || function () {};
     this._initHandler();
 
@@ -501,9 +502,9 @@ class LowAltitudeInteraction {
       if (!area.points || area.points.length < 3) return;
       // 扁平化 [lon, lat, height, ...]
       const positions = area.points.flat();
-
+      const color = this._parseColor(area.color, area.alpha || 0.4);
       // 在添加时判断id是否存在，如果存在，则删除，再添加新的
-      // 此处因为空域数量不会太多所以这样处理，数量超过以前则需要别的解决方案
+      // 此处因为数量不会太多所以这样处理，数量超过以前则需要别的解决方案
       const exists = this.viewer.entities.getById(area.id);
       if (exists) {
         this.viewer.entities.remove(exists);
@@ -514,9 +515,9 @@ class LowAltitudeInteraction {
         polygon: {
           hierarchy: Cesium.Cartesian3.fromDegreesArrayHeights(positions),
           perPositionHeight: true,
-          material: Cesium.Color[area.color]?.withAlpha(0.35) || defaultColor,
-          outline: true,
-          outlineColor: Cesium.Color.WHITE.withAlpha(0.7),
+          material: color,
+          outline: area.outline || false,
+          outlineColor: Cesium.Color.WHITE.withAlpha(0.6),
           extrudedHeight: area.height,
 
           closeTop: area.hasTop || false,
@@ -560,6 +561,8 @@ class LowAltitudeInteraction {
    * @returns {Array<Cesium.Entity>}  生成的实体数组
    */
   drawLabeledLines(array, options = {}) {
+    if (!this.viewer) throw new Error('请先调用 init()!');
+
     const entities = [];
 
     // 工具：生成闪烁材质
@@ -643,6 +646,147 @@ class LowAltitudeInteraction {
     return entities;
   }
 
+  // 显示飞机飞行轨迹线条
+
+  /**
+   * 高性能多段材质线条渲染
+   * @param {Array} linesData - 线条数据数组
+   * @returns {Cesium.Primitive} 返回创建的Primitive对象
+   */
+  drawPolylines(polylines, id) {
+    if (!this.viewer) throw new Error('请先调用 init()!');
+
+    // 参数校验：id
+    if (!id || (typeof id !== 'string' && typeof id !== 'number')) {
+      throw new Error('参数 id 必须是非空字符串或数字');
+    }
+
+    // 检查 id 是否已存在
+    if (!this.primitiveMap) {
+      this.primitiveMap = new Map();
+    }
+
+    // 参数校验：polylines
+    if (!Array.isArray(polylines)) {
+      throw new Error('参数 polylines 必须是数组类型');
+    }
+
+    if (polylines.length === 0) {
+      console.warn('drawPolylines: polylines 为空数组，无需绘制');
+      return;
+    }
+
+    // 参数校验：检查每个线条配置项的必要字段
+    const invalidItems = [];
+    polylines.forEach((line, index) => {
+      if (!line || typeof line !== 'object') {
+        invalidItems.push(`索引 ${index}: 线条配置项必须是对象`);
+        return;
+      }
+
+      // 校验 positions 字段
+      if (!Array.isArray(line.positions)) {
+        invalidItems.push(`索引 ${index}: positions 字段必须是数组`);
+      } else if (line.positions.length === 0) {
+        invalidItems.push(`索引 ${index}: positions 数组不能为空`);
+      } else {
+        // 检查 positions 数组中的每个点
+        line.positions.forEach((point, pointIndex) => {
+          if (!Array.isArray(point) || point.length !== 3) {
+            invalidItems.push(`索引 ${index}, 点 ${pointIndex}: 坐标点必须是包含3个元素的数组 [经度, 纬度, 高度]`);
+          }
+        });
+      }
+
+      // 校验 segmentColors 字段
+      if (!Array.isArray(line.segmentColors)) {
+        invalidItems.push(`索引 ${index}: segmentColors 字段必须是数组`);
+      } else if (line.segmentColors.length === 0) {
+        invalidItems.push(`索引 ${index}: segmentColors 数组不能为空`);
+      } else {
+        // 检查颜色配置
+        line.segmentColors.forEach((colorConfig, colorIndex) => {
+          if (!colorConfig || typeof colorConfig !== 'object') {
+            invalidItems.push(`索引 ${index}, 颜色 ${colorIndex}: 颜色配置必须是对象`);
+          } else {
+            if (!colorConfig.color) {
+              invalidItems.push(`索引 ${index}, 颜色 ${colorIndex}: color 字段不能为空`);
+            }
+            if (
+              colorConfig.alpha !== undefined &&
+              (typeof colorConfig.alpha !== 'number' || colorConfig.alpha < 0 || colorConfig.alpha > 1)
+            ) {
+              invalidItems.push(`索引 ${index}, 颜色 ${colorIndex}: alpha 值必须是 0-1 之间的数字`);
+            }
+          }
+        });
+      }
+
+      // 校验 width 字段（可选）
+      if (line.width !== undefined && (typeof line.width !== 'number' || line.width <= 0)) {
+        invalidItems.push(`索引 ${index}: width 字段必须是大于0的数字`);
+      }
+    });
+
+    if (invalidItems.length > 0) {
+      throw new Error(`drawPolylines 参数校验失败:\n${invalidItems.join('\n')}`);
+    }
+
+    // 此处如果id重复，则直接调用删除命令删除旧线条
+    if (this.primitiveMap.has(id)) {
+      this.deletePolylines(id);
+    }
+
+    const geometryInstances = [];
+
+    polylines.forEach((line, index) => {
+      const { positions, segmentColors, width = 3 } = line;
+
+      const points = positions.flat();
+      // 处理颜色数组，支持十六进制和混合比例
+      const processedColors = segmentColors.map((item) => this._parseColor(item.color || '#ffffff', item.alpha || 1.0));
+
+      // 为每个线条创建几何实例
+      const geometryInstance = new Cesium.GeometryInstance({
+        id: `line_${index}`,
+        geometry: new Cesium.PolylineGeometry({
+          positions: Cesium.Cartesian3.fromDegreesArrayHeights(points),
+          colors: processedColors, // 使用处理后的颜色数组
+          width: width,
+          vertexFormat: Cesium.PolylineColorAppearance.VERTEX_FORMAT,
+        }),
+      });
+
+      geometryInstances.push(geometryInstance);
+    });
+
+    // 创建单个Primitive包含所有线条
+    const primitive = new Cesium.Primitive({
+      geometryInstances: geometryInstances,
+      appearance: new Cesium.PolylineColorAppearance(),
+      asynchronous: true, // 异步创建，避免阻塞主线程
+      id,
+    });
+
+    const addedPrimitive = this.viewer.scene.primitives.add(primitive);
+    this.primitiveMap.set(id, addedPrimitive);
+  }
+
+  /* =========== 删除指定移除 Primitive =========== */
+  /**
+   * @param {string} id
+   * @returns {boolean} 成功 or 失败
+   */
+  deletePolylines(id) {
+    if (this.primitiveMap && this.primitiveMap.has(id)) {
+      const primitive = this.primitiveMap.get(id);
+      this.viewer.scene.primitives.remove(primitive);
+      this.primitiveMap.delete(id);
+      return true;
+    }
+    return false;
+  }
+
   /* =========== 删除指定实体 =========== */
   /**
    * @param {string[]} ids
@@ -667,7 +811,7 @@ class LowAltitudeInteraction {
 
         this.viewer.entities.remove(entity);
         this.entities.delete(id);
-        const positionIndex = this.modelPositions.findIndex((pos) => pos.id === id);
+        const positionIndex = this.modelPositions.findIndex((pos) => pos.id.toString() === id.toString());
         if (positionIndex !== -1) {
           this.modelPositions.splice(positionIndex, 1);
         }
@@ -685,7 +829,7 @@ class LowAltitudeInteraction {
           const entity = entities[i];
 
           // 检查实体名称是否包含目标ID
-          if (entity.id && entity.id.includes(id)) {
+          if (entity.id && entity.id.toString().includes(id.toString())) {
             this.viewer.entities.remove(entity);
             deletedCount++;
             deletedIds.push(id);
@@ -713,6 +857,12 @@ class LowAltitudeInteraction {
 
     // 清除所有实体
     this.viewer.entities.removeAll();
+
+    // 清除所有 Primitive
+    this.primitiveMap.forEach((primitive) => {
+      this.viewer.scene.primitives.remove(primitive);
+    });
+    this.primitiveMap.clear();
 
     // 重置点位数组和实体Map
     this.modelPositions = [];
@@ -756,6 +906,31 @@ class LowAltitudeInteraction {
       });
     }
     return list;
+  }
+
+  /* =========== 工具：生成cesium 颜色 =========== */
+  /**
+   * 十六进制颜色转Cesium颜色工具函数
+   * @param {string|Cesium.Color} color - 颜色值，支持十六进制字符串或Cesium.Color对象
+   * @param {number} alpha - 透明度/混合比例，范围0-1，默认1.0
+   * @returns {Cesium.Color} 返回Cesium颜色对象
+   */
+  _parseColor(color, alpha = 1.0) {
+    if (color instanceof Cesium.Color) {
+      return color.withAlpha(alpha);
+    }
+
+    if (typeof color === 'string') {
+      // 处理十六进制颜色字符串
+      if (color.startsWith('#')) {
+        return Cesium.Color.fromCssColorString(color).withAlpha(alpha);
+      }
+      // 处理CSS颜色名称
+      return Cesium.Color.fromCssColorString(color).withAlpha(alpha);
+    }
+
+    // 默认返回白色
+    return Cesium.Color.WHITE.withAlpha(0.6);
   }
 
   /* =========== 设置点击事件 =========== */
