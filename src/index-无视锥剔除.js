@@ -1,0 +1,965 @@
+import * as Cesium from 'cesium';
+import mitt from 'mitt';
+// 引入Cesium的默认样式文件
+const link = document.createElement('link');
+link.rel = 'stylesheet';
+link.href = '/cesium/Widgets/widgets.css'; // 相对于 public 目录
+document.head.appendChild(link);
+
+class LowAltitudeInteraction {
+  /** @param {Object} [options] 配置项 */
+  constructor(options = {}) {
+    this.options = options; // 用户传入配置
+    this.viewer = null; // Cesium.Viewer 实例
+    this.entities = new Map(); // id -> Cesium.Entity
+    this.primitiveMap = new Map(); // id -> Cesium.Primitive
+    this.modelPositions = []; // 点位合集（不一定有用，先存着）
+    this.emitter = mitt(); // 事件总线
+    this._airspaceClick = null;
+    this._fenceClick = null;
+    this._lineClick = null;
+    this._handler = null;
+
+    /* =========== 全局配置 & 部分优化策略 =========== */
+    window.CESIUM_BASE_URL = options.basePath || '/cesium';
+    // 同时发送的最大请求数量
+    Cesium.RequestScheduler.maximumRequests = 50;
+    // 同一服务器的最大并发请求数
+    Cesium.RequestScheduler.maximumRequestsPerServer = 18;
+    // 增加瓦片缓存数量
+    Cesium.TileReplacementQueue.maximumLength = options.tileReplacementQueueMax || 2000;
+
+    Cesium.Ion.defaultAccessToken = options.defaultAccessToken || '';
+
+    // Cesium.Camera.DEFAULT_VIEW_RECTANGLE = Cesium.Rectangle.fromDegrees(
+    //   // 西边的经度
+    //   89.5,
+    //   // 南边的纬度
+    //   22.5,
+    //   // 东边的经度
+    //   114.5,
+    //   // 北边的纬度
+    //   51.5,
+    // );
+  }
+
+  /* =========== 事件封装 =========== */
+  on(...args) {
+    this.emitter.on(...args);
+  } // cesium.on('ready', fn)
+  off(...args) {
+    this.emitter.off(...args);
+  }
+  emit(...args) {
+    this.emitter.emit(...args);
+  }
+
+  /* =========== 初始化 Viewer =========== */
+  /**
+   * @param {string|HTMLElement} container 选择器或 DOM 节点
+   * @returns {this}
+   */
+  init(container) {
+    const el = typeof container === 'string' ? document.querySelector('#' + container) : container;
+
+    if (!el) throw new Error('容器不存在');
+    this.viewer = new Cesium.Viewer(container, {
+      animation: false, // 动画控件
+      timeline: false, // 时间轴
+      geocoder: false, // 地址搜索框
+      homeButton: false, // 回到初始视图
+      sceneModePicker: false, // 场景模式切换按钮
+      navigationHelpButton: false, // 帮助按钮
+      selectionIndicator: false, // 实体选择指示器（即点击模型或地物时不会出现高亮或指示框）
+      vrButton: false, // VR 按钮（即界面上不会显示进入虚拟现实模式的按钮）
+      baseLayerPicker: false, // 底图图层控件显隐
+      imageryProvider: false, // 不使用默认底图
+      fullscreenButton: false, // 全屏按钮
+      infoBox: true, // 控制是否显示实体的信息框,默认显示
+      ...(this.options.viewer || {}),
+    });
+    // 去掉右下角版权
+    this.viewer.cesiumWidget.creditContainer.style.display = 'none';
+    // 关闭时间对光照的影响
+    this.viewer.scene.globe.enableLighting = false;
+    // 查看帧率
+    this.viewer.scene.debugShowFramesPerSecond = this.options.showFramesPerSecond || false;
+
+    this.emit('ready', this.viewer);
+    return this; // 支持链式
+  }
+
+  /* =========== 加载天地图影像 =========== */
+  loadTdtImagery() {
+    console.log('正在加载天地图影像...');
+    try {
+      // 影像类型img_w
+      // 地形渲染ter_w
+      const TDT_CONFIG = {
+        key: this.options.tdtKey,
+        imageType: 'img_w',
+        maxLevel: 18,
+      };
+
+      let url = `https://t{s}.tianditu.gov.cn/DataServer?T=${TDT_CONFIG.imageType}&x={x}&y={y}&l={z}&tk=${TDT_CONFIG.key}`;
+
+      const layerProvider = new Cesium.UrlTemplateImageryProvider({
+        url: url,
+        //  多级域名优化请求
+        subdomains: ['0', '1', '2', '3', '4', '5', '6', '7'],
+        //  使用WEB墨卡托图块方案
+        tilingScheme: new Cesium.WebMercatorTilingScheme(),
+        //  缩放级别
+        maximumLevel: TDT_CONFIG.maxLevel,
+        //  添加版权信息
+        credit: new Cesium.Credit('天地图', false),
+        // 缓存配置
+        enablePickFeatures: false, // 禁用拾取功能以提升性能
+        hasAlphaChannel: false, // 如果图像没有透明通道，设为false可提升性能
+        // rectangle: Cesium.Rectangle.fromDegrees(70, 10, 140, 55), // 限制加载范围
+      });
+      this.viewer.imageryLayers.addImageryProvider(layerProvider);
+
+      console.log('天地图影像加载完成');
+    } catch (error) {
+      console.error('天地图影像加载失败:', error);
+    }
+  }
+
+  /* =========== 加载3dtiles场景 =========== */
+  async load3DTiles() {
+    if (!this.viewer) throw new Error('请先调用 init()!');
+    if (!this.options.tilesetUrl) throw new Error('请先配置 tilesetUrl!');
+    try {
+      const tileset = await Cesium.Cesium3DTileset.fromUrl(
+        //  余杭20平方公里
+        this.options.tilesetUrl,
+
+        {
+          // =======⬇️⬇️⬇️3dtiles加载优化策略⬇️⬇️⬇️========
+          // 内存缓存大小 256MB，默认512
+          cacheBytes: 512 * 1024 * 1024,
+          // 最大缓存溢出 64MB 默认128
+          maximumCacheOverflowBytes: 128 * 1024 * 1024,
+          // 视距越远自动放松精度
+          dynamicScreenSpaceError: false,
+          // 允许跳过中间层级，直接加载更高精度的瓦片，可显著提升加载速度，默认false
+          skipLevelOfDetail: true,
+          // 指定跳过的层级数量，默认1
+          skipLevels: 1,
+          // 屏幕空间误差阈值
+          baseScreenSpaceError: 1024,
+          maximumScreenSpaceError: 16, // 默认 16；数值越大，请求越少，画质稍降
+          // 跳过屏幕空间误差因子
+          // skipScreenSpaceErrorFactor 值的影响:
+          // - 值越大(如32): 跳过更多层级,加载速度更快,但可能出现明显的LOD切换
+          // - 值越小(如16): 层级切换更平滑,但加载稍慢,占用更多内存
+          // - 建议范围: 8-32之间,根据实际效果和性能调整
+          skipScreenSpaceErrorFactor: 16,
+          // 立即加载目标精度层级
+          // - true ：直接加载目标精度，可能有较长等待时间
+          // - false ：渐进式加载，先显示低精度再逐步提升
+          immediatelyLoadDesiredLevelOfDetail: false,
+          // 加载兄弟节点
+          // - true ：同时加载相邻区域的瓦片，预加载更多内容
+          // - false ：只加载当前视野必需的瓦片
+          loadSiblings: false,
+          // 尽量直接请求叶子节点
+          preferLeaves: true,
+          // 移动时暂停请求
+          cullRequestsWhileMoving: true,
+          cullRequestsWhileMovingMultiplier: 10,
+          // MB，限制缓存占用
+          maximumMemoryUsage: 1024,
+          // =======⬆️⬆️⬆️3dtiles加载优化策略⬆️⬆️⬆️==========
+        },
+      );
+
+      this.viewer.scene.primitives.add(tileset);
+
+      /* 根据包围球自动飞行到较远视角 */
+      // await this.viewer.zoomTo(tileset, new Cesium.HeadingPitchRange(0, -0.6, tileset.boundingSphere.radius * 1.5));
+      // await this.viewer.zoomTo(tileset);
+    } catch (error) {
+      console.error(`瓦片加载出现错误: ${error}`);
+    }
+
+    console.log('3dtiles场景加载完成');
+  }
+
+  /* =========== 批量加载模型 =========== */
+  /**
+   * @param {number} [count=1000]
+   * @param {Array<Object>} [positions] 可传入自定义坐标
+   * @example { id:'id-1', lon:120.1, lat:30.2, height:200, name:'飞机-1' }
+   */
+  async loadModels(count = 1000, positions) {
+    if (!this.viewer) throw new Error('请先调用 init()!');
+    console.log(`开始${positions ? '生成并' : ''}加载 ${count} 个模型点位...`);
+
+    const list = positions || this._randomPositions(count);
+
+    try {
+      // 统计新增和更新的数量
+      let newCount = 0;
+      let updateCount = 0;
+
+      // 批量处理模型实体
+      let processedCount = 0;
+      const batchSize = 200;
+
+      const processBatch = (startIndex) => {
+        const endIndex = Math.min(startIndex + batchSize, list.length);
+
+        for (let i = startIndex; i < endIndex; i++) {
+          const position = list[i];
+          const positionId = position.id;
+
+          // 将经纬度转换为Cesium的Cartesian3坐标
+          const cartesianPosition = Cesium.Cartesian3.fromDegrees(
+            position.longitude,
+            position.latitude,
+            position.height,
+          );
+
+          // ===⬇️⬇️检查是否已存在相同序号的实体，如果存在即更新，不存在则新增⬇️⬇️===
+          if (this.entities.has(positionId)) {
+            // 更新已有实体的位置
+            const existingEntity = this.entities.get(positionId);
+            existingEntity.position = cartesianPosition;
+
+            // 更新标签文本
+            existingEntity.label.text = position.name;
+
+            // 更新描述信息
+            existingEntity.description = `
+              <div style="font-family: Arial, sans-serif; padding: 8px;">
+                <h3 style="color: #2c3e50; margin-top: 0;">${position.name}</h3>
+                <p><strong>序号:</strong> ${position.id}</p>
+                <p><strong>经度:</strong> ${position.longitude}°</p>
+                <p><strong>纬度:</strong> ${position.latitude}°</p>
+                <p><strong>高度:</strong> ${position.height}m</p>
+                <p><strong>状态:</strong> 位置已更新</p>
+                <p><strong>名称:</strong> ${position.name}</p>
+                <p><strong>区域:</strong> 杭州</p>
+              </div>
+            `;
+
+            updateCount++;
+          } else {
+            // 创建新的模型实体
+            const modelEntity = this.viewer.entities.add({
+              id: position.id,
+              name: position.name,
+              position: cartesianPosition,
+              model: {
+                uri: this.options.modelUri || '/cesium/model/fj.glb',
+                minimumPixelSize: 32, // 减小最小像素大小以提高性能
+                scale: Number(position.modelScale) || Number(this.options.modelScale) || 1,
+
+                // ====模型简单上色，颜色混合，半透明====
+                color: Cesium.Color.fromCssColorString(position.color || '#FFD700'), // 金色
+                colorBlendMode: Cesium.ColorBlendMode.MIX,
+                colorBlendAmount: position.colorBlendAmount || 0.5,
+
+                // 禁用(DISABLED)阴影以提高性能，开启(ENABLED)
+                shadows: Cesium.ShadowMode.DISABLED,
+                heightReference: Cesium.HeightReference.NONE,
+                // 是否运行模型动画,false表示禁用模型动画以提升性能
+                runAnimations: false,
+                // 🎯 添加模型距离显示条件, 0-40km范围内显示
+                distanceDisplayCondition: new Cesium.DistanceDisplayCondition(0, 40000),
+              },
+              label: {
+                text: position.name,
+                font: '12pt monospace',
+                style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+                outlineWidth: 1,
+                verticalOrigin: Cesium.VerticalOrigin.BOTTOM,
+                // 设置标签偏移量 (x, y)
+                // x: 0 表示水平居中
+                // y: -20 表示向上偏移14像素
+                pixelOffset: new Cesium.Cartesian2(0, -20),
+                fillColor: Cesium.Color.CYAN,
+                outlineColor: Cesium.Color.BLACK,
+                showBackground: true,
+                backgroundColor: new Cesium.Color(0.1, 0.1, 0.1, 0.5),
+                scale: Number(position.labelScale) || Number(this.options.labelScale) || 0.6,
+                // 设置标签的可见距离范围
+                // - 第一个参数 0: 表示最近可见距离(米)
+                // - 第二个参数 200000: 表示最远可见距离(米)
+                // 即当相机距离标签 0-40000米 之间时才显示标签,超出范围则隐藏
+                distanceDisplayCondition: new Cesium.DistanceDisplayCondition(0, 40000),
+              },
+              properties: {
+                mark: position.mark,
+              },
+              description: `
+                <div style="font-family: Arial, sans-serif; padding: 8px;">
+                  <h3 style="color: #2c3e50; margin-top: 0;">${position.name}</h3>
+                  <p><strong>序号:</strong> ${position.id}</p>
+                  <p><strong>经度:</strong> ${position.longitude}°</p>
+                  <p><strong>纬度:</strong> ${position.latitude}°</p>
+                  <p><strong>高度:</strong> ${position.height}m</p>
+                  <p><strong>状态:</strong> 新创建</p>
+                  <p><strong>名称:</strong> ${position.name}</p>
+                  <p><strong>区域:</strong> 杭州</p>
+                </div>
+              `,
+            });
+
+            // 将实体存储到Map中，以序号为键
+            this.entities.set(positionId, modelEntity);
+            newCount++;
+          }
+
+          processedCount++;
+        }
+
+        console.log(`已处理 ${processedCount}/${list.length} 个点位 (新增: ${newCount}, 更新: ${updateCount})`);
+
+        // 继续处理下一批
+        if (endIndex < list.length) {
+          // 避免闭包捕获复杂对象，使用简单的递归调用
+          const nextIndex = endIndex;
+          setTimeout(() => {
+            processBatch(nextIndex);
+          }, 30);
+        } else {
+          // 全部处理完成
+          console.log(`批量处理完成！`);
+          console.log(`- 新增点位: ${newCount} 个`);
+          console.log(`- 更新点位: ${updateCount} 个`);
+          console.log(`- 总计点位: ${this.entities.size} 个`);
+
+          // 更新全局点位数组
+          this.modelPositions = list;
+        }
+      };
+
+      // 开始分批处理
+      processBatch(0);
+    } catch (error) {
+      console.error('加载模型时出错:', error);
+    }
+  }
+
+  /* =========== 相机飞向指定坐标 =========== */
+  flyTo(destination, orientation = { heading: 0, pitch: -45, roll: 0 }, duration = 2) {
+    if (!this.viewer) throw new Error('请先调用 init()!');
+    // 校验 destination 参数
+    if (
+      !destination ||
+      typeof destination.longitude !== 'number' ||
+      typeof destination.latitude !== 'number' ||
+      typeof destination.height !== 'number' ||
+      isNaN(destination.longitude) ||
+      isNaN(destination.latitude) ||
+      isNaN(destination.height)
+    ) {
+      throw new Error('destination 参数无效，必须包含经度、纬度和高度，且均为数字');
+    }
+    if (destination.height > 100000) {
+      throw new Error('高度不能大于100000米');
+    }
+    this.viewer.camera.flyTo({
+      destination: Cesium.Cartesian3.fromDegrees(destination.longitude, destination.latitude, destination.height),
+      orientation: {
+        // Cesium.Math.toRadians 方法用于将角度值转换为弧度值
+        heading: Cesium.Math.toRadians(orientation.heading), // heading：相机的航向角，0表示正北方向
+        pitch: Cesium.Math.toRadians(orientation.pitch), // pitch：相机的俯仰角，-45表示向下俯视45度
+        roll: Cesium.Math.toRadians(orientation.roll), // roll：相机的横滚角，0表示无侧倾
+      },
+      duration,
+    });
+  }
+
+  /* =========== 飞向指定模型 && 相机跟踪 =========== */
+  flyToModel(id, trackedEntity = true) {
+    if (!this.viewer) throw new Error('请先调用 init()!');
+    if (!this.modelPositions || this.modelPositions.length === 0) {
+      console.warn('没有可飞向的模型');
+      return;
+    }
+    const entity = this.entities.get(id);
+    if (!entity) {
+      console.warn(`未找到id为 ${id} 的模型，请检查序号是否正确`);
+      return;
+    }
+    const { cameraHeight = 500, cameraHeading = 0, cameraPitch = -30, flyDuration = 1.5 } = this.options.flyToModel;
+
+    const position = entity.position.getValue(this.viewer.clock.currentTime);
+    if (position) {
+      // 将笛卡尔坐标转换为地理坐标
+      const cartographic = Cesium.Cartographic.fromCartesian(position);
+      const longitude = Cesium.Math.toDegrees(cartographic.longitude);
+      const latitude = Cesium.Math.toDegrees(cartographic.latitude);
+
+      // 使用与双击事件相同的相机参数
+      const customCameraOptions = {
+        destination: Cesium.Cartesian3.fromDegrees(longitude, latitude - 0.008, cartographic.height + cameraHeight),
+        orientation: {
+          heading: Cesium.Math.toRadians(cameraHeading),
+          pitch: Cesium.Math.toRadians(cameraPitch),
+          roll: 0.0,
+        },
+        duration: flyDuration,
+      };
+
+      // 设置选中的实体，实现选中效果
+      this.viewer.selectedEntity = entity;
+
+      // 设置相机跟踪锁定到选中的实体
+      this.viewer.trackedEntity = trackedEntity ? entity : undefined;
+
+      // 执行相机飞行
+      this.viewer.camera.flyTo(customCameraOptions);
+
+      console.log(`通过id ${id} 选择模型 ${entity.name}，相机飞向目标位置`);
+    }
+
+    return this;
+  }
+
+  /* =========== 取消相机跟踪 =========== */
+  cancelTracking() {
+    if (!this.viewer) throw new Error('请先调用 init()!');
+    this.viewer.trackedEntity = undefined;
+    this.viewer.selectedEntity = undefined;
+    console.log('已取消相机跟踪锁定，恢复自由相机控制');
+    // 取消相机飞行动作
+    // this.viewer.camera.cancelFlight();
+    return this;
+  }
+
+  /* =========== 绘制执飞空域 =========== */
+  drawAirspaces(areas, options = {}) {
+    if (!this.viewer) throw new Error('请先调用 init()!');
+
+    this._airspaceClick = options.onClick || function () {};
+    this._initHandler();
+
+    const entities = [];
+    const originalColorMap = new Map(); // 存储 entityId -> 原始材质
+
+    // —— 创建区域 ——
+    areas.forEach((area, index) => {
+      if (!area.points || area.points.length < 3) return;
+      // 扁平化 [lon, lat, height, ...]
+      const positions = area.points.flat();
+      const color = this._parseColor(area.color, area.alpha || 0.4);
+      // 在添加时判断id是否存在，如果存在，则删除，再添加新的
+      // 此处因为空域数量不会太多所以这样处理，数量超过以前则需要别的解决方案
+      const exists = this.viewer.entities.getById(area.id);
+      if (exists) {
+        this.viewer.entities.remove(exists);
+      }
+      const entity = this.viewer.entities.add({
+        id: area.id,
+        name: area.id,
+        polygon: {
+          hierarchy: Cesium.Cartesian3.fromDegreesArrayHeights(positions),
+          perPositionHeight: true,
+          material: color,
+          outline: area.outline || false,
+          outlineColor: Cesium.Color.WHITE.withAlpha(0.6),
+          extrudedHeight: area.height,
+
+          closeTop: area.hasTop || false,
+          closeBottom: area.hasTop || false,
+        },
+        properties: {
+          id: area.id,
+          type: area.type || 'AIRSPACE',
+        },
+        description: `
+          <div style="font-family: Arial, sans-serif; padding: 8px;">
+            <h3 style="color: #2c3e50; margin-top: 0;">${area.id}</h3>
+            <p><strong>ID:</strong> ${area.id}</p>
+            <p><strong>高度:</strong> ${area.height}</p>
+          </div>
+        `,
+      });
+
+      originalColorMap.set(entity.id, entity.polygon.material);
+      entities.push(entity);
+    });
+
+    return entities;
+  }
+
+  /* =========== 绘制电子围栏 =========== */
+  drawFence(areas, options = {}) {
+    if (!this.viewer) throw new Error('请先调用 init()!');
+    this._fenceClick = options.onClick || function () {};
+    this._initHandler();
+
+    const entities = [];
+    const originalColorMap = new Map(); // 存储 entityId -> 原始材质
+
+    // —— 创建区域 ——
+    areas.forEach((area, index) => {
+      if (!area.points || area.points.length < 3) return;
+      // 扁平化 [lon, lat, height, ...]
+      const positions = area.points.flat();
+      const color = this._parseColor(area.color, area.alpha || 0.4);
+      // 在添加时判断id是否存在，如果存在，则删除，再添加新的
+      // 此处因为数量不会太多所以这样处理，数量超过以前则需要别的解决方案
+      const exists = this.viewer.entities.getById(area.id);
+      if (exists) {
+        this.viewer.entities.remove(exists);
+      }
+      const entity = this.viewer.entities.add({
+        id: area.id,
+        name: area.id,
+        polygon: {
+          hierarchy: Cesium.Cartesian3.fromDegreesArrayHeights(positions),
+          perPositionHeight: true,
+          material: color,
+          outline: area.outline || false,
+          outlineColor: Cesium.Color.WHITE.withAlpha(0.6),
+          extrudedHeight: area.height,
+
+          closeTop: area.hasTop || false,
+          closeBottom: area.hasTop || false,
+        },
+        properties: {
+          id: area.id,
+          type: area.type || 'FENCE',
+        },
+        description: `
+          <div style="font-family: Arial, sans-serif; padding: 8px;">
+            <h3 style="color: #2c3e50; margin-top: 0;">${area.id}</h3>
+            <p><strong>ID:</strong> ${area.id}</p>
+            <p><strong>高度:</strong> ${area.height}</p>
+          </div>
+        `,
+      });
+
+      originalColorMap.set(entity.id, entity.polygon.material);
+      entities.push(entity);
+    });
+
+    return entities;
+  }
+
+  // 显示告警连接线
+  /**
+   * 批量绘制带文字的线条
+   * @param {Array} array  配置数组，每项格式 ↓
+   *   {
+   *     id:        "line-001",            // 必填，业务 ID
+   *     label:     "A → B 航线",          // 必填，文字
+   *     pointA:    [lon, lat, height],    // 必填，起点
+   *     pointB:    [lon, lat, height],    // 必填，终点
+   *     color:     Cesium.Color.RED,      // 选填，默认黄色
+   *     width:     2,                     // 选填，线宽
+   *     flash:     true                   // 选填，是否闪烁
+   *     type:      'LINE'                 // 选填，类型，默认LINE
+   *   }
+   * @param {Object} options  配置对象，可选
+   * @returns {Array<Cesium.Entity>}  生成的实体数组
+   */
+  drawLabeledLines(array, options = {}) {
+    if (!this.viewer) throw new Error('请先调用 init()!');
+
+    const entities = [];
+
+    // 工具：生成闪烁材质
+    const createFlashMaterial = (color) => {
+      // 回调让 alpha 在 0.2 ~ 1.0 之间循环
+      const colorCallback = new Cesium.CallbackProperty(() => {
+        const t = (Date.now() % 1000) / 1000; // 0-1
+        const alpha = 0.2 + Math.abs(Math.sin(t * Math.PI)) * 0.7;
+        return Cesium.Color.fromAlpha(color, alpha);
+      }, false);
+      return new Cesium.ColorMaterialProperty(colorCallback);
+    };
+
+    this._lineClick = options.onClick || function () {};
+    this._initHandler();
+
+    array.forEach((cfg) => {
+      const { id, label, pointA, pointB, type = 'LINE', color = Cesium.Color.YELLOW, width = 2, flash = false } = cfg;
+
+      // 两端三维坐标
+      const positions = Cesium.Cartesian3.fromDegreesArrayHeights([...pointA, ...pointB]);
+      // 中点，用于放文字
+      const mid = Cesium.Cartesian3.midpoint(positions[0], positions[1], new Cesium.Cartesian3());
+
+      // 线条材质：静态 or 闪烁
+      const lineMaterial = flash
+        ? createFlashMaterial(Cesium.Color[color])
+        : new Cesium.ColorMaterialProperty(Cesium.Color[color]);
+
+      // 在添加时判断id是否存在，如果存在，则删除，再添加新的
+      // 此处因为空域数量不会太多所以这样处理，数量超过以前则需要别的解决方案
+      const exists = this.viewer.entities.getById(id);
+      if (exists) {
+        this.viewer.entities.remove(exists);
+      }
+
+      const entity = this.viewer.entities.add({
+        id,
+        polyline: {
+          positions,
+          material: lineMaterial,
+          width,
+          clampToGround: false,
+        },
+        label: {
+          text: label,
+          font: '13px sans-serif',
+          // fillColor: Cesium.Color.WHITE,
+          fillColor: Cesium.Color[color], // 此处设置为跟线条颜色一致
+          outlineColor: Cesium.Color.BLACK,
+          outlineWidth: 2,
+          style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+          showBackground: true,
+          backgroundColor: Cesium.Color.BLACK.withAlpha(0.4),
+          horizontalOrigin: Cesium.HorizontalOrigin.CENTER,
+          verticalOrigin: Cesium.VerticalOrigin.BOTTOM,
+          pixelOffset: new Cesium.Cartesian2(0, -10),
+          // 设置标签的可见距离范围
+          // - 第一个参数 0: 表示最近可见距离(米)
+          // - 第二个参数 200000: 表示最远可见距离(米)
+          // 即当相机距离标签 0-100000米 之间时才显示标签,超出范围则隐藏
+          distanceDisplayCondition: new Cesium.DistanceDisplayCondition(0, 80000),
+        },
+        position: mid,
+        properties: { id, flashFlag: flash, type: type || 'LINE' },
+        description: `
+          <div style="font-family: Arial, sans-serif; padding: 8px;">
+          <h3 style="color: #2c3e50; margin-top: 0;">${id}</h3>
+          <p><strong>ID:</strong> ${id}</p>
+          <p><strong>描述:</strong> ${label}</p>
+          <p><strong>宽度:</strong> ${width}</p>
+          <p><strong>pointA:</strong> ${pointA}</p>
+          <p><strong>pointB:</strong> ${pointB}</p>
+        </div>
+      `,
+      });
+
+      entities.push(entity);
+    });
+
+    return entities;
+  }
+
+  // 显示飞机飞行轨迹线条
+
+  /**
+   * 高性能多段材质线条渲染
+   * @param {Array} linesData - 线条数据数组
+   * @returns {Cesium.Primitive} 返回创建的Primitive对象
+   */
+  drawPolylines(polylines, id) {
+    if (!this.viewer) throw new Error('请先调用 init()!');
+
+    // 参数校验：id
+    if (!id || (typeof id !== 'string' && typeof id !== 'number')) {
+      throw new Error('参数 id 必须是非空字符串或数字');
+    }
+
+    // 检查 id 是否已存在
+    if (!this.primitiveMap) {
+      this.primitiveMap = new Map();
+    }
+
+    // 参数校验：polylines
+    if (!Array.isArray(polylines)) {
+      throw new Error('参数 polylines 必须是数组类型');
+    }
+
+    if (polylines.length === 0) {
+      console.warn('drawPolylines: polylines 为空数组，无需绘制');
+      return;
+    }
+
+    // 参数校验：检查每个线条配置项的必要字段
+    const invalidItems = [];
+    polylines.forEach((line, index) => {
+      if (!line || typeof line !== 'object') {
+        invalidItems.push(`索引 ${index}: 线条配置项必须是对象`);
+        return;
+      }
+
+      // 校验 positions 字段
+      if (!Array.isArray(line.positions)) {
+        invalidItems.push(`索引 ${index}: positions 字段必须是数组`);
+      } else if (line.positions.length === 0) {
+        invalidItems.push(`索引 ${index}: positions 数组不能为空`);
+      } else {
+        // 检查 positions 数组中的每个点
+        line.positions.forEach((point, pointIndex) => {
+          if (!Array.isArray(point) || point.length !== 3) {
+            invalidItems.push(`索引 ${index}, 点 ${pointIndex}: 坐标点必须是包含3个元素的数组 [经度, 纬度, 高度]`);
+          }
+        });
+      }
+
+      // 校验 segmentColors 字段
+      if (!Array.isArray(line.segmentColors)) {
+        invalidItems.push(`索引 ${index}: segmentColors 字段必须是数组`);
+      } else if (line.segmentColors.length === 0) {
+        invalidItems.push(`索引 ${index}: segmentColors 数组不能为空`);
+      } else {
+        // 检查颜色配置
+        line.segmentColors.forEach((colorConfig, colorIndex) => {
+          if (!colorConfig || typeof colorConfig !== 'object') {
+            invalidItems.push(`索引 ${index}, 颜色 ${colorIndex}: 颜色配置必须是对象`);
+          } else {
+            if (!colorConfig.color) {
+              invalidItems.push(`索引 ${index}, 颜色 ${colorIndex}: color 字段不能为空`);
+            }
+            if (
+              colorConfig.alpha !== undefined &&
+              (typeof colorConfig.alpha !== 'number' || colorConfig.alpha < 0 || colorConfig.alpha > 1)
+            ) {
+              invalidItems.push(`索引 ${index}, 颜色 ${colorIndex}: alpha 值必须是 0-1 之间的数字`);
+            }
+          }
+        });
+      }
+
+      // 校验 width 字段（可选）
+      if (line.width !== undefined && (typeof line.width !== 'number' || line.width <= 0)) {
+        invalidItems.push(`索引 ${index}: width 字段必须是大于0的数字`);
+      }
+    });
+
+    if (invalidItems.length > 0) {
+      throw new Error(`drawPolylines 参数校验失败:\n${invalidItems.join('\n')}`);
+    }
+
+    // 此处如果id重复，则直接调用删除命令删除旧线条
+    if (this.primitiveMap.has(id)) {
+      this.deletePolylines(id);
+    }
+
+    const geometryInstances = [];
+
+    polylines.forEach((line, index) => {
+      const { positions, segmentColors, width = 3 } = line;
+
+      const points = positions.flat();
+      // 处理颜色数组，支持十六进制和混合比例
+      const processedColors = segmentColors.map((item) => this._parseColor(item.color || '#ffffff', item.alpha || 1.0));
+
+      // 为每个线条创建几何实例
+      const geometryInstance = new Cesium.GeometryInstance({
+        id: `line_${index}`,
+        geometry: new Cesium.PolylineGeometry({
+          positions: Cesium.Cartesian3.fromDegreesArrayHeights(points),
+          colors: processedColors, // 使用处理后的颜色数组
+          width: width,
+          vertexFormat: Cesium.PolylineColorAppearance.VERTEX_FORMAT,
+        }),
+      });
+
+      geometryInstances.push(geometryInstance);
+    });
+
+    // 创建单个Primitive包含所有线条
+    const primitive = new Cesium.Primitive({
+      geometryInstances: geometryInstances,
+      appearance: new Cesium.PolylineColorAppearance(),
+      asynchronous: true, // 异步创建，避免阻塞主线程
+      id,
+    });
+
+    const addedPrimitive = this.viewer.scene.primitives.add(primitive);
+    this.primitiveMap.set(id, addedPrimitive);
+  }
+
+  /* =========== 删除指定移除 Primitive =========== */
+  /**
+   * @param {string} id
+   * @returns {boolean} 成功 or 失败
+   */
+  deletePolylines(id) {
+    if (this.primitiveMap && this.primitiveMap.has(id)) {
+      const primitive = this.primitiveMap.get(id);
+      this.viewer.scene.primitives.remove(primitive);
+      this.primitiveMap.delete(id);
+      return true;
+    }
+    return false;
+  }
+
+  /* =========== 删除指定实体 =========== */
+  /**
+   * @param {string[]} ids
+   */
+  deleteByIds(ids = []) {
+    if (!Array.isArray(ids) || ids.length === 0) {
+      console.warn('deleteByIds: 请提供有效的模型ID数组');
+      return { success: false, message: '无效的模型ID数组' };
+    }
+
+    console.log(`开始删除模型，ID列表:`, ids);
+
+    let deletedCount = 0;
+    let notFoundCount = 0;
+    const deletedIds = [];
+    const notFoundIds = [];
+
+    ids.forEach((id) => {
+      // 首先尝试从 this.entities Map 中查找（普通模型点位）
+      if (this.entities.has(id)) {
+        const entity = this.entities.get(id);
+
+        this.viewer.entities.remove(entity);
+        this.entities.delete(id);
+        const positionIndex = this.modelPositions.findIndex((pos) => pos.id.toString() === id.toString());
+        if (positionIndex !== -1) {
+          this.modelPositions.splice(positionIndex, 1);
+        }
+
+        deletedCount++;
+        deletedIds.push(id);
+        console.log(`✓ 已删除模型: ${id}`);
+      } else {
+        // 尝试通过实体名称或属性查找（空域、围栏等特殊实体）
+        const entities = this.viewer.entities.values;
+
+        let found = false;
+
+        for (let i = 0; i < entities.length; i++) {
+          const entity = entities[i];
+
+          // 检查实体名称是否包含目标ID
+          if (entity.id && entity.id.toString().includes(id.toString())) {
+            this.viewer.entities.remove(entity);
+            deletedCount++;
+            deletedIds.push(id);
+            found = true;
+            console.log(`✓ 已删除实体: ${entity.id} (匹配ID: ${id})`);
+            break;
+          }
+        }
+
+        if (!found) {
+          notFoundCount++;
+          notFoundIds.push(id);
+          console.warn(`✗ 未找到模型: ${id}`);
+        }
+      }
+    });
+
+    console.log(`删除完成，共删除 ${deletedCount} 个模型，未找到 ${notFoundCount} 个模型`);
+    return this;
+  }
+
+  /* =========== 清除所有模型 =========== */
+  clearAllModels() {
+    console.log('清除所有模型点位...');
+
+    // 清除所有实体
+    this.viewer.entities.removeAll();
+
+    // 清除所有 Primitive
+    this.primitiveMap.forEach((primitive) => {
+      this.viewer.scene.primitives.remove(primitive);
+    });
+    this.primitiveMap.clear();
+
+    // 重置点位数组和实体Map
+    this.modelPositions = [];
+    this.entities.clear();
+
+    console.log('已清除所有模型点位，实体Map已重置');
+  }
+
+  /* =========== Cesium 销毁释放 =========== */
+  destroy() {
+    this.viewer && this.viewer.destroy();
+    this.entities.clear();
+    this.emitter.all.clear();
+    console.log(`Cesium 实例销毁完成`);
+  }
+
+  /* =========== 工具：生成随机点 =========== */
+  _randomPositions(count) {
+    const list = [];
+    const bounds = {
+      minLon: 118.21,
+      maxLon: 120.3,
+      minLat: 29.11,
+      maxLat: 30.6,
+      minH: 50,
+      maxH: 1000,
+    };
+
+    for (let i = 0; i < count; i++) {
+      const lon = bounds.minLon + Math.random() * (bounds.maxLon - bounds.minLon);
+      const lat = bounds.minLat + Math.random() * (bounds.maxLat - bounds.minLat);
+      const h = bounds.minH + Math.random() * (bounds.maxH - bounds.minH);
+      const id = `id-${i + 1}`;
+      list.push({
+        id,
+        longitude: +lon.toFixed(6),
+        latitude: +lat.toFixed(6),
+        height: Math.round(h),
+        name: `杭州点位_${String(i + 1).padStart(4, '0')}`,
+        mark: id,
+      });
+    }
+    return list;
+  }
+
+  /* =========== 工具：生成cesium 颜色 =========== */
+  /**
+   * 十六进制颜色转Cesium颜色工具函数
+   * @param {string|Cesium.Color} color - 颜色值，支持十六进制字符串或Cesium.Color对象
+   * @param {number} alpha - 透明度/混合比例，范围0-1，默认1.0
+   * @returns {Cesium.Color} 返回Cesium颜色对象
+   */
+  _parseColor(color, alpha = 1.0) {
+    if (color instanceof Cesium.Color) {
+      return color.withAlpha(alpha);
+    }
+
+    if (typeof color === 'string') {
+      // 处理十六进制颜色字符串
+      if (color.startsWith('#')) {
+        return Cesium.Color.fromCssColorString(color).withAlpha(alpha);
+      }
+      // 处理CSS颜色名称
+      return Cesium.Color.fromCssColorString(color).withAlpha(alpha);
+    }
+
+    // 默认返回白色
+    return Cesium.Color.WHITE.withAlpha(0.6);
+  }
+
+  /* =========== 设置点击事件 =========== */
+  _initHandler() {
+    if (this._handler) {
+      this._handler.destroy();
+      this._handler = null;
+    }
+    this._handler = new Cesium.ScreenSpaceEventHandler(this.viewer.scene.canvas);
+    this._handler.setInputAction((click) => {
+      const picked = this.viewer.scene.pick(click.position);
+      const entity = picked && picked.id;
+      if (entity && entity.properties && entity.properties.id) {
+        const id = entity.properties.id.getValue(this.viewer.clock.currentTime);
+        const type =
+          entity.properties.type && entity.properties.type.getValue
+            ? entity.properties.type.getValue(this.viewer.clock.currentTime)
+            : entity.properties.type;
+
+        if (type === 'FENCE') {
+          this._fenceClick && this._fenceClick(id);
+        } else if (type === 'AIRSPACE') {
+          this._airspaceClick && this._airspaceClick(id);
+        } else if (type === 'LINE') {
+          this._lineClick && this._lineClick(id);
+        }
+      }
+    }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
+  }
+}
+
+export default LowAltitudeInteraction;

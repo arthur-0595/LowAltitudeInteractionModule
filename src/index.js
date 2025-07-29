@@ -19,6 +19,18 @@ class LowAltitudeInteraction {
     this._fenceClick = null;
     this._lineClick = null;
     this._handler = null;
+    this._frustumCullingTimeout = null;
+    this._boundUpdateFrustumCulling = null; // 保存绑定的函数引用，用于移除事件监听器
+
+    // 视锥剔除性能监控
+    this._frustumCullingStats = {
+      totalExecutions: 0,
+      totalProcessedEntities: 0,
+      totalCulledEntities: 0,
+      totalDistanceCulledEntities: 0,
+      averageExecutionTime: 0,
+      lastExecutionTime: 0,
+    };
 
     /* =========== 全局配置 & 部分优化策略 =========== */
     window.CESIUM_BASE_URL = options.basePath || '/cesium';
@@ -30,6 +42,15 @@ class LowAltitudeInteraction {
     Cesium.TileReplacementQueue.maximumLength = options.tileReplacementQueueMax || 2000;
 
     Cesium.Ion.defaultAccessToken = options.defaultAccessToken || '';
+
+    // 视锥剔除配置
+    this.frustumCullingConfig = {
+      enabled: options.enableFrustumCulling !== false, // 默认启用
+      debounceTime: options.frustumCullingDebounceTime || 200, // 防抖时间
+      maxDistance: options.frustumCullingMaxDistance || 5000, // 最大处理距离
+      baseRadius: options.frustumCullingBaseRadius || 25, // 基础边界球半径
+      debug: options.debugFrustumCulling || false, // 调试模式
+    };
 
     // Cesium.Camera.DEFAULT_VIEW_RECTANGLE = Cesium.Rectangle.fromDegrees(
     //   // 西边的经度
@@ -85,7 +106,14 @@ class LowAltitudeInteraction {
     // 查看帧率
     this.viewer.scene.debugShowFramesPerSecond = this.options.showFramesPerSecond || false;
 
+    // 根据配置决定是否启用视锥剔除
+    if (this.frustumCullingConfig.enabled) {
+      this._boundUpdateFrustumCulling = this._updateFrustumCulling.bind(this);
+      this.viewer.camera.changed.addEventListener(this._boundUpdateFrustumCulling);
+    }
+
     this.emit('ready', this.viewer);
+
     return this; // 支持链式
   }
 
@@ -226,7 +254,8 @@ class LowAltitudeInteraction {
           if (this.entities.has(positionId)) {
             // 更新已有实体的位置
             const existingEntity = this.entities.get(positionId);
-            existingEntity.position = cartesianPosition;
+            // 修复：使用 ConstantPositionProperty 确保位置可以通过 getValue() 方法获取
+            existingEntity.position = new Cesium.ConstantPositionProperty(cartesianPosition);
 
             // 更新标签文本
             existingEntity.label.text = position.name;
@@ -267,8 +296,8 @@ class LowAltitudeInteraction {
                 heightReference: Cesium.HeightReference.NONE,
                 // 是否运行模型动画,false表示禁用模型动画以提升性能
                 runAnimations: false,
-                // 🎯 添加模型距离显示条件, 0-40km范围内显示
-                distanceDisplayCondition: new Cesium.DistanceDisplayCondition(0, 40000),
+                // 🎯 添加模型距离显示条件, 0-10km范围内显示（与视锥剔除距离保持一致）
+                distanceDisplayCondition: new Cesium.DistanceDisplayCondition(0, 5000),
               },
               label: {
                 text: position.name,
@@ -285,11 +314,8 @@ class LowAltitudeInteraction {
                 showBackground: true,
                 backgroundColor: new Cesium.Color(0.1, 0.1, 0.1, 0.5),
                 scale: Number(position.labelScale) || Number(this.options.labelScale) || 0.6,
-                // 设置标签的可见距离范围
-                // - 第一个参数 0: 表示最近可见距离(米)
-                // - 第二个参数 200000: 表示最远可见距离(米)
-                // 即当相机距离标签 0-40000米 之间时才显示标签,超出范围则隐藏
-                distanceDisplayCondition: new Cesium.DistanceDisplayCondition(0, 40000),
+                // 🎯 添加模型标签距离显示条件, 0-2km范围内显示
+                distanceDisplayCondition: new Cesium.DistanceDisplayCondition(0, 2000),
               },
               properties: {
                 mark: position.mark,
@@ -334,6 +360,13 @@ class LowAltitudeInteraction {
 
           // 更新全局点位数组
           this.modelPositions = list;
+
+          // 位置更新完成后，手动触发一次视锥剔除以确保正确显示
+          if (this.frustumCullingConfig.enabled) {
+            setTimeout(() => {
+              this._performFrustumCulling();
+            }, 100); // 延迟100ms确保所有位置更新完成
+          }
         }
       };
 
@@ -447,6 +480,8 @@ class LowAltitudeInteraction {
       if (!area.points || area.points.length < 3) return;
       // 扁平化 [lon, lat, height, ...]
       const positions = area.points.flat();
+      console.log(positions);
+
       const color = this._parseColor(area.color, area.alpha || 0.4);
       // 在添加时判断id是否存在，如果存在，则删除，再添加新的
       // 此处因为空域数量不会太多所以这样处理，数量超过以前则需要别的解决方案
@@ -454,34 +489,72 @@ class LowAltitudeInteraction {
       if (exists) {
         this.viewer.entities.remove(exists);
       }
-      const entity = this.viewer.entities.add({
-        id: area.id,
-        name: area.id,
-        polygon: {
-          hierarchy: Cesium.Cartesian3.fromDegreesArrayHeights(positions),
-          perPositionHeight: true,
-          material: color,
-          outline: area.outline || false,
-          outlineColor: Cesium.Color.WHITE.withAlpha(0.6),
-          extrudedHeight: area.height,
-
-          closeTop: area.hasTop || false,
-          closeBottom: area.hasTop || false,
-        },
-        properties: {
+      let entity = null;
+      // 走廊，通道型
+      if (area.type == 'CORRIDOR') {
+        entity = this.viewer.entities.add({
           id: area.id,
-          type: area.type || 'AIRSPACE',
-        },
-        description: `
+          name: area.id,
+          corridor: {
+            positions: Cesium.Cartesian3.fromDegreesArray(positions),
+            material: color,
+            outline: area.outline || false,
+            outlineColor: Cesium.Color.WHITE.withAlpha(0.6),
+            extrudedHeight: area.height,
+            width: area.width || 100,
+          },
+          properties: {
+            id: area.id,
+            type: area.type,
+          },
+          description: `
           <div style="font-family: Arial, sans-serif; padding: 8px;">
             <h3 style="color: #2c3e50; margin-top: 0;">${area.id}</h3>
             <p><strong>ID:</strong> ${area.id}</p>
             <p><strong>高度:</strong> ${area.height}</p>
           </div>
         `,
-      });
+        });
 
-      originalColorMap.set(entity.id, entity.polygon.material);
+        originalColorMap.set(entity.id, entity.corridor.material);
+      } else {
+        entity = this.viewer.entities.add({
+          id: area.id,
+          name: area.id,
+          polygon: {
+            // 使用 holes 参数来定义多边形中的洞
+            // 外部轮廓
+            hierarchy: new Cesium.PolygonHierarchy(
+              Cesium.Cartesian3.fromDegreesArrayHeights(positions),
+              // 内部洞的轮廓数组
+              area.holes?.map(
+                (hole) => new Cesium.PolygonHierarchy(Cesium.Cartesian3.fromDegreesArrayHeights(hole.flat())),
+              ),
+            ),
+            perPositionHeight: true, // 设置为 true 可以让多边形按照每个点的实际高度进行绘制,形成不规则的3D多边形
+            material: color,
+            outline: area.outline || false,
+            outlineColor: Cesium.Color.WHITE.withAlpha(0.6),
+            extrudedHeight: area.height,
+
+            closeTop: area.hasTop || false,
+            closeBottom: area.hasTop || false,
+          },
+          properties: {
+            id: area.id,
+            type: area.type || 'AIRSPACE',
+          },
+          description: `
+          <div style="font-family: Arial, sans-serif; padding: 8px;">
+            <h3 style="color: #2c3e50; margin-top: 0;">${area.id}</h3>
+            <p><strong>ID:</strong> ${area.id}</p>
+            <p><strong>高度:</strong> ${area.height}</p>
+          </div>
+        `,
+        });
+        originalColorMap.set(entity.id, entity.polygon.material);
+      }
+
       entities.push(entity);
     });
 
@@ -872,21 +945,58 @@ class LowAltitudeInteraction {
   }
 
   /* =========== Cesium 销毁释放 =========== */
+  /**
+   * 销毁实例，清理所有资源
+   * 包括相机事件监听器、定时器、实体等
+   */
   destroy() {
-    this.viewer && this.viewer.destroy();
-    this.entities.clear();
-    this.emitter.all.clear();
-    console.log(`Cesium 实例销毁完成`);
+    try {
+      // 清理视锥剔除定时器
+      if (this._frustumCullingTimeout) {
+        clearTimeout(this._frustumCullingTimeout);
+        this._frustumCullingTimeout = null;
+      }
+
+      // 清理相机事件监听器
+      if (this.viewer && this.viewer.camera && this._boundUpdateFrustumCulling) {
+        this.viewer.camera.changed.removeEventListener(this._boundUpdateFrustumCulling);
+        this._boundUpdateFrustumCulling = null;
+      }
+
+      // 清理事件处理器
+      if (this._handler) {
+        this._handler.destroy();
+        this._handler = null;
+      }
+
+      // 清理实体和位置数据
+      this.entities.clear();
+      this.modelPositions = [];
+      this.primitiveMap.clear();
+
+      // 清理事件发射器
+      this.emitter.all.clear();
+
+      // 销毁viewer
+      if (this.viewer) {
+        this.viewer.destroy();
+        this.viewer = null;
+      }
+
+      console.log('Cesium 实例销毁完成，所有资源已清理');
+    } catch (error) {
+      console.error('销毁实例时出错:', error);
+    }
   }
 
   /* =========== 工具：生成随机点 =========== */
   _randomPositions(count) {
     const list = [];
     const bounds = {
-      minLon: 118.21,
-      maxLon: 120.3,
-      minLat: 29.11,
-      maxLat: 30.6,
+      minLon: 119.956752,
+      maxLon: 120.031154,
+      minLat: 30.266192,
+      maxLat: 30.303925,
       minH: 50,
       maxH: 1000,
     };
@@ -933,7 +1043,162 @@ class LowAltitudeInteraction {
     return Cesium.Color.WHITE.withAlpha(0.6);
   }
 
-  /* =========== 设置点击事件 =========== */
+  /**
+   * 更新视锥剔除（防抖处理）
+   * @private
+   */
+  _updateFrustumCulling() {
+    // 清除之前的定时器
+    if (this._frustumCullingTimeout) {
+      clearTimeout(this._frustumCullingTimeout);
+    }
+
+    // 设置新的定时器，延迟执行视锥剔除
+    this._frustumCullingTimeout = setTimeout(() => {
+      this._performFrustumCulling();
+    }, this.frustumCullingConfig.debounceTime);
+  }
+
+  /**
+   * 执行视锥剔除优化
+   * 添加距离检查和性能优化
+   * @private
+   */
+  _performFrustumCulling() {
+    try {
+      if (!this.viewer || this.entities.size === 0) {
+        return;
+      }
+
+      const camera = this.viewer.camera;
+      const cameraPosition = camera.position;
+      const frustum = camera.frustum;
+      const cullingVolume = frustum.computeCullingVolume(cameraPosition, camera.direction, camera.up);
+      const currentTime = this.viewer.clock.currentTime;
+
+      // 性能优化：使用配置的最大处理距离
+      const maxCullingDistance = this.frustumCullingConfig.maxDistance;
+      const maxCullingDistanceSquared = maxCullingDistance * maxCullingDistance;
+
+      // 性能监控：记录开始时间
+      const startTime = performance.now();
+
+      // 性能计数器
+      let processedCount = 0;
+      let culledCount = 0;
+      let distanceCulledCount = 0;
+
+      this.entities.forEach((entity, entityId) => {
+        try {
+          // 🎯 特殊处理：被跟踪或选中的实体始终保持可见
+          const isTrackedEntity = this.viewer.trackedEntity === entity;
+          const isSelectedEntity = this.viewer.selectedEntity === entity;
+          if (isTrackedEntity || isSelectedEntity) {
+            if (entity.show !== true) {
+              entity.show = true;
+            }
+            processedCount++;
+            return;
+          }
+
+          // 获取实体位置
+          const position = entity.position?.getValue(currentTime);
+          if (!position) {
+            return;
+          }
+
+          // 距离检查优化：计算相机到实体的距离
+          const distanceSquared = Cesium.Cartesian3.distanceSquared(cameraPosition, position);
+
+          // 如果距离超过最大剔除距离，直接隐藏
+          if (distanceSquared > maxCullingDistanceSquared) {
+            if (entity.show !== false) {
+              entity.show = false;
+              distanceCulledCount++;
+            }
+            return;
+          }
+
+          // 动态边界球半径：根据模型缩放和距离调整
+          const modelScale = entity.model?.scale?.getValue(currentTime) || 1;
+          const baseRadius = this.frustumCullingConfig.baseRadius;
+          const scaledRadius = baseRadius * (typeof modelScale === 'number' ? modelScale : 1);
+
+          // 根据距离调整边界球大小（远处的模型可以用更小的边界球）
+          const distance = Math.sqrt(distanceSquared);
+          const distanceFactor = Math.min(1, distance / 1000); // 1公里内保持原始大小
+          const finalRadius = scaledRadius * (1 + distanceFactor * 0.5);
+
+          const boundingSphere = new Cesium.BoundingSphere(position, finalRadius);
+
+          // 视锥剔除检查
+          const visibility = cullingVolume.computeVisibility(boundingSphere);
+          const shouldShow = visibility !== Cesium.Intersect.OUTSIDE;
+
+          // 只在状态改变时更新显示属性，减少不必要的操作
+          if (entity.show !== shouldShow) {
+            entity.show = shouldShow;
+            if (!shouldShow) {
+              culledCount++;
+            }
+          }
+
+          processedCount++;
+        } catch (entityError) {
+          console.warn(`处理实体 ${entityId} 时出错:`, entityError);
+        }
+      });
+
+      // 性能监控：更新统计数据
+      const executionTime = performance.now() - startTime;
+      this._updateFrustumCullingStats(processedCount, culledCount, distanceCulledCount, executionTime);
+
+      // 性能日志（仅在调试模式下输出）
+      if (this.frustumCullingConfig.debug) {
+        const visibleCount = processedCount - culledCount - distanceCulledCount;
+        console.log(
+          `视锥剔除完成: 处理${processedCount}个实体, 可见${visibleCount}个, 视锥剔除${culledCount}个, 距离剔除${distanceCulledCount}个, 耗时${executionTime.toFixed(
+            2,
+          )}ms`,
+        );
+
+        // 如果没有可见模型，输出警告
+        if (visibleCount === 0 && processedCount > 0) {
+          console.warn('⚠️ 当前视野内没有可见模型，可能的原因：');
+          console.warn('1. 相机距离过远（超过10公里）');
+          console.warn('2. 所有模型都在视锥外');
+          console.warn('3. 模型位置更新后未正确设置');
+          console.warn('建议：调整相机位置或检查模型坐标');
+        }
+      }
+    } catch (error) {
+      console.error('视锥剔除执行出错:', error);
+    }
+  }
+
+  /**
+   * 更新视锥剔除性能统计
+   * @param {number} processedCount - 处理的实体数量
+   * @param {number} culledCount - 被视锥剔除的实体数量
+   * @param {number} distanceCulledCount - 被距离剔除的实体数量
+   * @param {number} executionTime - 执行时间（毫秒）
+   * @private
+   */
+  _updateFrustumCullingStats(processedCount, culledCount, distanceCulledCount, executionTime) {
+    const stats = this._frustumCullingStats;
+
+    stats.totalExecutions++;
+    stats.totalProcessedEntities += processedCount;
+    stats.totalCulledEntities += culledCount;
+    stats.totalDistanceCulledEntities += distanceCulledCount;
+    stats.lastExecutionTime = executionTime;
+
+    // 计算平均执行时间
+    stats.averageExecutionTime =
+      (stats.averageExecutionTime * (stats.totalExecutions - 1) + executionTime) / stats.totalExecutions;
+  }
+
+  /* =========== 事件处理器 =========== */
   _initHandler() {
     if (this._handler) {
       this._handler.destroy();
