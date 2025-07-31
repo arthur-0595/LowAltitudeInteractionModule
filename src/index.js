@@ -3,8 +3,17 @@ import mitt from 'mitt';
 // 引入Cesium的默认样式文件
 const link = document.createElement('link');
 link.rel = 'stylesheet';
-link.href = '/cesium/Widgets/widgets.css'; // 相对于 public 目录
+link.href = '/cesium/Widgets/widgets.css';
 document.head.appendChild(link);
+// 自定义样式
+const style = document.createElement('style');
+style.textContent = `
+  .cesium-infoBox {
+    top: 120px !important;
+    left: 20px !important;
+  }
+`;
+document.head.appendChild(style);
 
 class LowAltitudeInteraction {
   /** @param {Object} [options] 配置项 */
@@ -265,12 +274,11 @@ class LowAltitudeInteraction {
               <div style="font-family: Arial, sans-serif; padding: 8px;">
                 <h3 style="color: #2c3e50; margin-top: 0;">${position.name}</h3>
                 <p><strong>序号:</strong> ${position.id}</p>
-                <p><strong>经度:</strong> ${position.longitude}°</p>
-                <p><strong>纬度:</strong> ${position.latitude}°</p>
-                <p><strong>高度:</strong> ${position.height}m</p>
+                <p><strong>经度:</strong> ${position.longitude}</p>
+                <p><strong>纬度:</strong> ${position.latitude}</p>
+                <p><strong>高度:</strong> ${position.height}</p>
                 <p><strong>状态:</strong> 位置已更新</p>
                 <p><strong>名称:</strong> ${position.name}</p>
-                <p><strong>区域:</strong> 杭州</p>
               </div>
             `;
 
@@ -289,7 +297,7 @@ class LowAltitudeInteraction {
                 // ====模型简单上色，颜色混合，半透明====
                 color: Cesium.Color.fromCssColorString(position.color || '#FFD700'), // 金色
                 colorBlendMode: Cesium.ColorBlendMode.MIX,
-                colorBlendAmount: position.colorBlendAmount || 0.5,
+                colorBlendAmount: position.colorBlendAmount || 0.67,
 
                 // 禁用(DISABLED)阴影以提高性能，开启(ENABLED)
                 shadows: Cesium.ShadowMode.DISABLED,
@@ -324,12 +332,11 @@ class LowAltitudeInteraction {
                 <div style="font-family: Arial, sans-serif; padding: 8px;">
                   <h3 style="color: #2c3e50; margin-top: 0;">${position.name}</h3>
                   <p><strong>序号:</strong> ${position.id}</p>
-                  <p><strong>经度:</strong> ${position.longitude}°</p>
-                  <p><strong>纬度:</strong> ${position.latitude}°</p>
-                  <p><strong>高度:</strong> ${position.height}m</p>
+                  <p><strong>经度:</strong> ${position.longitude}</p>
+                  <p><strong>纬度:</strong> ${position.latitude}</p>
+                  <p><strong>高度:</strong> ${position.height}</p>
                   <p><strong>状态:</strong> 新创建</p>
                   <p><strong>名称:</strong> ${position.name}</p>
-                  <p><strong>区域:</strong> 杭州</p>
                 </div>
               `,
             });
@@ -473,15 +480,12 @@ class LowAltitudeInteraction {
     this._initHandler();
 
     const entities = [];
-    const originalColorMap = new Map(); // 存储 entityId -> 原始材质
 
     // —— 创建区域 ——
     areas.forEach((area, index) => {
       if (!area.points || area.points.length < 3) return;
       // 扁平化 [lon, lat, height, ...]
       const positions = area.points.flat();
-      console.log(positions);
-
       const color = this._parseColor(area.color, area.alpha || 0.4);
       // 在添加时判断id是否存在，如果存在，则删除，再添加新的
       // 此处因为空域数量不会太多所以这样处理，数量超过以前则需要别的解决方案
@@ -502,6 +506,7 @@ class LowAltitudeInteraction {
             outlineColor: Cesium.Color.WHITE.withAlpha(0.6),
             extrudedHeight: area.height,
             width: area.width || 100,
+            distanceDisplayCondition: new Cesium.DistanceDisplayCondition(0, 30000), // 显示条件(距离)
           },
           properties: {
             id: area.id,
@@ -515,8 +520,6 @@ class LowAltitudeInteraction {
           </div>
         `,
         });
-
-        originalColorMap.set(entity.id, entity.corridor.material);
       } else {
         entity = this.viewer.entities.add({
           id: area.id,
@@ -539,6 +542,7 @@ class LowAltitudeInteraction {
 
             closeTop: area.hasTop || false,
             closeBottom: area.hasTop || false,
+            distanceDisplayCondition: new Cesium.DistanceDisplayCondition(0, 30000), // 显示条件(距离)
           },
           properties: {
             id: area.id,
@@ -552,7 +556,6 @@ class LowAltitudeInteraction {
           </div>
         `,
         });
-        originalColorMap.set(entity.id, entity.polygon.material);
       }
 
       entities.push(entity);
@@ -568,33 +571,39 @@ class LowAltitudeInteraction {
     this._initHandler();
 
     const entities = [];
-    const originalColorMap = new Map(); // 存储 entityId -> 原始材质
+    const wallType = {
+      1: {
+        image: '/cesium/Assets/material/wall.png',
+        color: Cesium.Color.BLUE,
+      },
+      2: {
+        image: '/cesium/Assets/material/flyLine.png',
+        color: Cesium.Color.RED,
+      },
+    };
 
     // —— 创建区域 ——
     areas.forEach((area, index) => {
       if (!area.points || area.points.length < 3) return;
-      // 扁平化 [lon, lat, height, ...]
       const positions = area.points.flat();
-      const color = this._parseColor(area.color, area.alpha || 0.4);
       // 在添加时判断id是否存在，如果存在，则删除，再添加新的
-      // 此处因为数量不会太多所以这样处理，数量超过以前则需要别的解决方案
       const exists = this.viewer.entities.getById(area.id);
-      if (exists) {
-        this.viewer.entities.remove(exists);
-      }
+      if (exists) this.viewer.entities.remove(exists);
       const entity = this.viewer.entities.add({
         id: area.id,
         name: area.id,
-        polygon: {
-          hierarchy: Cesium.Cartesian3.fromDegreesArrayHeights(positions),
-          perPositionHeight: true,
-          material: color,
-          outline: area.outline || false,
-          outlineColor: Cesium.Color.WHITE.withAlpha(0.6),
-          extrudedHeight: area.height,
-
-          closeTop: area.hasTop || false,
-          closeBottom: area.hasTop || false,
+        wall: {
+          positions: Cesium.Cartesian3.fromDegreesArray(positions),
+          maximumHeights: new Array(area.points.length).fill(area.height),
+          minimunHeights: new Array(area.points.length).fill(0),
+          // 动态材质
+          material: new DynamicWallMaterialProperty({
+            viewer: this.viewer,
+            trailImage: area.wallType ? wallType[area.wallType].image : wallType[1].image,
+            color: area.wallType ? wallType[area.wallType].color : wallType[1].color,
+            duration: 2000,
+          }),
+          distanceDisplayCondition: new Cesium.DistanceDisplayCondition(0, 30000), // 显示条件(距离)
         },
         properties: {
           id: area.id,
@@ -605,11 +614,11 @@ class LowAltitudeInteraction {
             <h3 style="color: #2c3e50; margin-top: 0;">${area.id}</h3>
             <p><strong>ID:</strong> ${area.id}</p>
             <p><strong>高度:</strong> ${area.height}</p>
+            <p><strong>类型:</strong> 电子围栏</p>
           </div>
         `,
       });
 
-      originalColorMap.set(entity.id, entity.polygon.material);
       entities.push(entity);
     });
 
@@ -693,11 +702,7 @@ class LowAltitudeInteraction {
           horizontalOrigin: Cesium.HorizontalOrigin.CENTER,
           verticalOrigin: Cesium.VerticalOrigin.BOTTOM,
           pixelOffset: new Cesium.Cartesian2(0, -10),
-          // 设置标签的可见距离范围
-          // - 第一个参数 0: 表示最近可见距离(米)
-          // - 第二个参数 200000: 表示最远可见距离(米)
-          // 即当相机距离标签 0-100000米 之间时才显示标签,超出范围则隐藏
-          distanceDisplayCondition: new Cesium.DistanceDisplayCondition(0, 80000),
+          distanceDisplayCondition: new Cesium.DistanceDisplayCondition(0, 30000), // 设置标签的可见距离范围
         },
         position: mid,
         properties: { id, flashFlag: flash, type: type || 'LINE' },
@@ -840,6 +845,7 @@ class LowAltitudeInteraction {
       asynchronous: true, // 异步创建，避免阻塞主线程
       id,
     });
+    console.log(11);
 
     const addedPrimitive = this.viewer.scene.primitives.add(primitive);
     this.primitiveMap.set(id, addedPrimitive);
@@ -1226,5 +1232,283 @@ class LowAltitudeInteraction {
     }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
   }
 }
+
+// 动态墙材质配置常量
+const DYNAMIC_WALL_CONSTANTS = {
+  // 默认配置
+  DEFAULT_OPTIONS: {
+    color: new Cesium.Color(1.0, 1.0, 1.0, 1.0),
+    duration: 3000,
+    trailImage: '',
+    count: 3.0,
+    direction: '-', // "+":由下到上  "-":由上到下
+    freely: 'vertical',
+  },
+  // 动画方向枚举
+  ANIMATION_DIRECTION: {
+    VERTICAL: 'vertical',
+    HORIZONTAL: 'horizontal',
+  },
+  // 时间方向枚举
+  TIME_DIRECTION: {
+    FORWARD: '+',
+    BACKWARD: '-',
+  },
+};
+
+/**
+ * 动态墙材质属性类
+ * 用于创建具有动态效果的墙体材质，支持垂直和水平方向的动画效果
+ */
+class DynamicWallMaterialProperty {
+  /**
+   * 构造函数
+   * @param {Object} options - 配置选项
+   * @param {Cesium.Color} options.color - 材质颜色
+   * @param {number} options.duration - 动画持续时间（毫秒）
+   * @param {string} options.trailImage - 纹理图像路径
+   * @param {Cesium.Viewer} options.viewer - Cesium视图对象
+   */
+  constructor(options = {}) {
+    // 参数验证
+    this._validateOptions(options);
+
+    // 合并默认配置
+    const config = { ...DYNAMIC_WALL_CONSTANTS.DEFAULT_OPTIONS, ...options };
+
+    // 初始化属性
+    this._definitionChanged = new Cesium.Event();
+    this._color = undefined;
+    this._colorSubscription = undefined;
+    this._startTime = performance.now(); // 使用高精度时间戳
+    this._viewer = config.viewer;
+
+    // 设置公共属性
+    this.color = config.color;
+    this.duration = config.duration;
+    this.trailImage = config.trailImage;
+
+    // 性能优化：缓存渲染请求
+    this._lastRenderTime = 0;
+    this._renderThrottle = 16; // 约60fps
+  }
+
+  /**
+   * 验证构造函数参数
+   * @private
+   * @param {Object} options - 配置选项
+   */
+  _validateOptions(options) {
+    if (!options.viewer || !options.viewer.scene) {
+      throw new Error('DynamicWallMaterialProperty: viewer参数是必需的');
+    }
+
+    if (options.duration && (typeof options.duration !== 'number' || options.duration <= 0)) {
+      console.warn('DynamicWallMaterialProperty: duration应为正数，使用默认值');
+    }
+  }
+
+  /**
+   * 获取材质类型
+   * @param {Cesium.JulianDate} time - 当前时间
+   * @returns {string} 材质类型标识
+   */
+  getType(time) {
+    return MaterialType;
+  }
+
+  /**
+   * 获取材质属性值
+   * @param {Cesium.JulianDate} time - 当前时间
+   * @param {Object} result - 结果对象
+   * @returns {Object} 材质属性对象
+   */
+  getValue(time, result) {
+    if (!Cesium.defined(result)) {
+      result = {};
+    }
+
+    // 获取颜色属性
+    result.color = Cesium.Property.getValueOrClonedDefault(this._color, time, Cesium.Color.WHITE, result.color);
+
+    // 设置纹理图像
+    result.image = this.trailImage;
+
+    // 计算时间进度（优化性能）
+    if (this.duration) {
+      const currentTime = performance.now();
+      const elapsed = currentTime - this._startTime;
+      result.time = (elapsed % this.duration) / this.duration;
+    }
+
+    // 节流渲染请求以提高性能
+    this._throttledRender();
+
+    return result;
+  }
+
+  /**
+   * 节流渲染请求
+   * @private
+   */
+  _throttledRender() {
+    const now = performance.now();
+    if (now - this._lastRenderTime >= this._renderThrottle) {
+      this._viewer.scene.requestRender();
+      this._lastRenderTime = now;
+    }
+  }
+
+  /**
+   * 比较两个材质属性对象是否相等
+   * @param {DynamicWallMaterialProperty} other - 另一个材质属性对象
+   * @returns {boolean} 是否相等
+   */
+  equals(other) {
+    return (
+      this === other ||
+      (other instanceof DynamicWallMaterialProperty &&
+        Cesium.Property.equals(this._color, other._color) &&
+        this.duration === other.duration &&
+        this.trailImage === other.trailImage)
+    );
+  }
+
+  /**
+   * 销毁资源
+   */
+  destroy() {
+    if (this._colorSubscription) {
+      this._colorSubscription();
+      this._colorSubscription = undefined;
+    }
+    this._definitionChanged = undefined;
+    this._viewer = undefined;
+  }
+}
+
+/**
+ * 生成动态墙体着色器代码
+ * @param {Object} options - 着色器配置选项
+ * @param {boolean} options.get - 是否生成着色器
+ * @param {number} options.count - 重复次数
+ * @param {string} options.freely - 动画方向（'vertical' 或 'horizontal'）
+ * @param {string} options.direction - 时间方向（'+' 或 '-'）
+ * @returns {string} 着色器源码
+ */
+function _getDirectionWallShader(options = {}) {
+  // 参数验证
+  if (!options || !options.get) {
+    console.warn('_getDirectionWallShader: 无效的选项参数');
+    return '';
+  }
+
+  // 默认配置
+  const config = {
+    count: options.count || 3.0,
+    freely: options.freely || DYNAMIC_WALL_CONSTANTS.ANIMATION_DIRECTION.VERTICAL,
+    direction: options.direction || DYNAMIC_WALL_CONSTANTS.TIME_DIRECTION.FORWARD,
+  };
+
+  // 着色器基础结构
+  const shaderBase = `
+    czm_material czm_getMaterial(czm_materialInput materialInput) {
+      // 获取默认材质实例
+      czm_material material = czm_getDefaultMaterial(materialInput);
+      // 获取纹理坐标
+      vec2 st = materialInput.st;
+  `;
+
+  // 根据动画方向生成纹理采样代码
+  let textureCode = '';
+  if (config.freely === DYNAMIC_WALL_CONSTANTS.ANIMATION_DIRECTION.VERTICAL) {
+    // 垂直方向动画：st.t随时间变化，st.s保持不变
+    textureCode = `
+      vec4 colorImage = texture(image, vec2(
+        fract(st.s), 
+        fract(float(${config.count}) * st.t ${config.direction} time)
+      ));
+    `;
+  } else {
+    // 水平方向动画：st.s随时间变化，st.t保持不变
+    textureCode = `
+      vec4 colorImage = texture(image, vec2(
+        fract(float(${config.count}) * st.s ${config.direction} time), 
+        fract(st.t)
+      ));
+    `;
+  }
+
+  // 泛光效果和最终输出
+  const shaderEnd = `
+      // 计算泛光效果
+      vec4 fragColor;
+      fragColor.rgb = (colorImage.rgb + color.rgb) / 1.0;
+      fragColor = czm_gammaCorrect(fragColor);
+      
+      // 设置材质属性
+      material.diffuse = colorImage.rgb;
+      material.alpha = colorImage.a;
+      material.emission = fragColor.rgb;
+      
+      return material;
+    }
+  `;
+
+  return shaderBase + textureCode + shaderEnd;
+}
+
+// 定义材质属性描述符
+Object.defineProperties(DynamicWallMaterialProperty.prototype, {
+  /**
+   * 材质是否为常量（动态材质始终返回false）
+   */
+  isConstant: {
+    get: function () {
+      return false;
+    },
+  },
+  /**
+   * 定义变更事件
+   */
+  definitionChanged: {
+    get: function () {
+      return this._definitionChanged;
+    },
+  },
+  /**
+   * 颜色属性描述符
+   */
+  color: Cesium.createPropertyDescriptor('color'),
+});
+
+// 生成唯一的材质类型标识
+const MaterialType = `dynamicWall_${Date.now()}_${Math.floor(Math.random() * 10000)}`;
+
+// 注册材质到Cesium材质缓存
+Cesium.Material._materialCache.addMaterial(MaterialType, {
+  fabric: {
+    type: MaterialType,
+    uniforms: {
+      color: DYNAMIC_WALL_CONSTANTS.DEFAULT_OPTIONS.color.clone(),
+      image: DYNAMIC_WALL_CONSTANTS.DEFAULT_OPTIONS.trailImage,
+      time: 0.0,
+    },
+    source: _getDirectionWallShader({
+      get: true,
+      count: DYNAMIC_WALL_CONSTANTS.DEFAULT_OPTIONS.count,
+      freely: DYNAMIC_WALL_CONSTANTS.DEFAULT_OPTIONS.freely,
+      direction: DYNAMIC_WALL_CONSTANTS.DEFAULT_OPTIONS.direction,
+    }),
+  },
+  /**
+   * 确定材质是否为半透明
+   * @param {Cesium.Material} material - 材质对象
+   * @returns {boolean} 是否半透明
+   */
+  translucent: function (material) {
+    return true;
+  },
+});
 
 export default LowAltitudeInteraction;

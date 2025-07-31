@@ -1,6 +1,6 @@
 {
   "name": "@hlid/cesium-engine",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "description": "封装好的 Cesium 场景 SDK",
   "main": "dist/index.min.js",
   "scripts": {
